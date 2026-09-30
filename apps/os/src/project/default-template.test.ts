@@ -98,8 +98,46 @@ test("an email an agent already has under its key, from an earlier version of th
   expect(project.appended["/agents/email/t1"]).toHaveLength(1);
 });
 
-/** An in-memory project a template's `processEvent` runs against, its appends keyed as the platform's. */
-function fakeProject(Template: typeof DefaultTemplate = DefaultTemplate) {
+test.for([
+  { template: "default", Template: DefaultTemplate },
+  { template: "heartbeat", Template: HeartbeatTemplate },
+])(
+  "$template: a new agent gets the config repo's AGENTS.md as a system message, once",
+  async ({ Template }) => {
+    const project = fakeProject(Template, { "AGENTS.md": "# Project\n\nUse itx.chrome." });
+    const created = { type: "events.iterate.com/agent/created", path: "/agents/a" };
+    for (const event of [created, created]) await project.deliver(event);
+    expect(project).toMatchObject({
+      appended: {
+        "/agents/a": [
+          {
+            type: "events.iterate.com/agent/context-added",
+            idempotencyKey: "agents-md:/agents/a",
+            payload: {
+              role: "system",
+              content: expect.stringMatching(
+                /when you were created:\n\n# Project\n\nUse itx\.chrome\.$/,
+              ),
+            },
+          },
+        ],
+      },
+    });
+  },
+);
+
+test("a config repo without AGENTS.md gives a new agent nothing", async () => {
+  const project = fakeProject(DefaultTemplate, {});
+  await project.deliver({ type: "events.iterate.com/agent/created", path: "/agents/a" });
+  expect(project.appended["/agents/a"]).toBeUndefined();
+});
+
+/** An in-memory project a template's `processEvent` runs against, its appends keyed as the platform's;
+ *  `configFiles` is what its /repos/config holds. */
+function fakeProject(
+  Template: typeof DefaultTemplate = DefaultTemplate,
+  configFiles: Record<string, string> = {},
+) {
   const rules: Record<string, unknown> = {};
   const rows: Record<string, unknown> = {};
   const schedules: Record<string, { when: unknown; events: unknown; scheduledAtOffset: number }> =
@@ -125,6 +163,11 @@ function fakeProject(Template: typeof DefaultTemplate = DefaultTemplate) {
   };
   const itx = {
     kv: { put: async () => ({ ok: true }) },
+    repos: {
+      get: (path: string) => ({
+        readFile: async (file: string) => (path === "/repos/config" && configFiles[file]) || null,
+      }),
+    },
     processors: {
       enable: async (name: string, spec: unknown) => {
         rows[name] = spec;

@@ -22,6 +22,9 @@ processor imports `StreamProcessor` and `defineProcessorContract` from `iterate/
     and the website. So only the platform's own record of a member's mail sent straight from their
     domain reaches one; a forward, a list's copy, a re-sent old message, an auto-reply or a bounce
     is ignored.
+  - The `events.iterate.com/agent/created` case gives every new agent this file: its text, once,
+    as a system message the agent reads on every turn and never answers. An agent created before
+    an edit keeps the version it was given; delete the case to stop it.
 - `fetch` serves every host of the project. The `x-iterate-routing-slug` header names the host
   (`blog` for `blog--<project>`, absent on the apex), so route on it with a plain `if`. A request
   a fetch route takes never reaches it: the platform sends it to the route's target first

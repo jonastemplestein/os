@@ -16,6 +16,26 @@ export default class extends IterateConfigEntrypoint {
         await installVoice(itx);
         return;
       }
+      case "events.iterate.com/agent/created": {
+        // Every new agent gets this repo's AGENTS.md: its text, once, as a system message the agent
+        // reads on every turn and never answers. Delete this case to stop it.
+        const agentsMd = await itx.repos.get("/repos/config").readFile("AGENTS.md");
+        if (!agentsMd) return;
+        await itx
+          .cd(event.path)
+          .append({
+            type: "events.iterate.com/agent/context-added",
+            idempotencyKey: `agents-md:${event.path}`,
+            payload: {
+              role: "system",
+              content: `This project's AGENTS.md (/repos/config), as it was when you were created:\n\n${agentsMd}`,
+            },
+          })
+          .catch((error: unknown) => {
+            if (errorCode(error) !== "IDEMPOTENCY_CONFLICT") throw error;
+          });
+        return;
+      }
       case "events.iterate.com/itx/woken":
         // a context woke: its alarm fired or a caller reached it (event.payload.cause)
         return;
