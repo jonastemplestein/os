@@ -330,8 +330,10 @@ export function resolveItxExpression(
   let rulesList: readonly ItxExpressionRewriteRule[] | undefined;
   for (let rewrites = 0; ; rewrites++) {
     if (isBuiltInsRooted(current)) return chain;
-    if (rewrites >= 32)
-      throw new Error(`itx-expression rewriting exceeded depth 32 — self-referential rule?`);
+    if (rewrites >= REWRITE_BUDGET)
+      throw new Error(
+        `itx-expression rewriting exceeded depth ${String(REWRITE_BUDGET)} — self-referential rule?`,
+      );
     const root = itxExpressionStepName(current[1]);
     const implicit = current[0] === "itx" && !!root && implicitRoots.has(root);
     const winner =
@@ -816,6 +818,12 @@ export function rpcStubKeysNamed(args: {
   }
   return keys;
 }
+
+/** How many rewrites one call may take before it is refused as self-referential, and so how many
+ *  bare links `rewriteRules.list()` follows by default: a list that stopped sooner would leave out
+ *  names a call from the same context reaches (an agent's subagent's sandbox is four links from
+ *  the project's root). */
+export const REWRITE_BUDGET = 32;
 
 // ── THE TABLE, DESCRIBED (pure; the DO hands it the rows and the hop) ──
 

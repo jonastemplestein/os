@@ -100,6 +100,7 @@ import {
 } from "./app-config.ts";
 import {
   ItxExpressionResolver,
+  REWRITE_BUDGET,
   describeRewriteRules,
   rowsNamingRpcStub,
   refuseLiftingAJail,
@@ -1110,7 +1111,7 @@ export class IterateContextDurableObject extends DurableObject<Env> {
     },
     fetchRoutes: () => this.#stream.coreReducedState.fetchRoutes,
     rewriteRules: {
-      list: (depth = 3) => this.#rewriteRuleListAt(depth),
+      list: (depth = REWRITE_BUDGET) => this.#rewriteRuleListAt(depth),
       // Canonicalized the same way `provide` canonicalized the match; an unparseable one is no row.
       get: async (match) => {
         let key: string;

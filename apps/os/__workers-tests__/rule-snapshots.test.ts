@@ -84,6 +84,19 @@ test("a mask a schedule appends takes the fence as a written one does: a repeat 
   expect(Date.now() - served).toBeGreaterThanOrEqual(SNAPSHOT_TTL_MS);
 });
 
+test("a list names everything a call from the same context reaches: an agent's subagent's sandbox, four links from the root, lists the root's rows", async () => {
+  const { root, sandbox } = await agentUnderRoot();
+  // a subagent links to the sandbox that created it, and has a sandbox of its own
+  const subagent = `${root}.iterate/agents/a/b`;
+  await stub(subagent).append(rule("itx", "itx.cd('/agents/a/sandbox')"));
+  await stub(`${subagent}/sandbox`).append(rule("itx", "itx.cd('/agents/a/b')"));
+  expect(await stub(`${subagent}/sandbox`).invoke("itx.kv.get('nothing')")).toBeNull();
+  const rows = (name: string) => stub(name).invoke("itx.rewriteRules.list()");
+  const rootRow = { match: "itx.kv", target: "itx.builtins.kv", context: "/" };
+  expect(await rows(sandbox)).toContainEqual(expect.objectContaining(rootRow));
+  expect(await rows(`${subagent}/sandbox`)).toContainEqual(expect.objectContaining(rootRow));
+});
+
 test("a name provided on the root answers the root's next line, and a child and a sandbox two parent links down within SNAPSHOT_TTL_MS + 250 ms", async () => {
   const { itx, agent, sandbox } = await agentUnderRoot();
   expect(await stub(sandbox).invoke("itx.kv.get('nothing')")).toBeNull(); // both links read
