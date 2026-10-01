@@ -367,12 +367,106 @@ export type CfBrowserQuickAction =
 export type CfBrowserQuickActionOptions = Record<string, unknown> &
   ({ url: string } | { html: string });
 
-/** `itx.browser`: Cloudflare Browser Run — the raw CDP `fetch`, and `quickAction`, which answers the
- *  action's RESULT (a string, parsed JSON, or bytes for a screenshot or a PDF), not the binding's
- *  `{ success, result }` envelope; a failed action throws. */
+/** What a browser session is acquired with: how long it lives idle (`keepAlive`, 10 seconds to 20
+ *  minutes, in milliseconds), whether it is recorded, the country its requests leave from (ISO
+ *  3166 alpha-2), and the hosts it may reach. */
+export type CfBrowserSessionOptions = {
+  keepAlive?: number;
+  recording?: boolean;
+  location?: string;
+  guardrails?: { allowedDomains?: string[]; allowedDomainSets?: string[] };
+};
+
+/** A tab (or worker, or frame) of a session's browser, as its DevTools endpoint lists it. */
+export type CfBrowserTarget = {
+  id: string;
+  type: string;
+  url: string;
+  title?: string;
+  description?: string;
+  webSocketDebuggerUrl?: string;
+  devtoolsFrontendUrl?: string;
+};
+
+/** A page a session has open, once it loaded (`loaded: false` when its load event did not arrive
+ *  in time: the page may still be usable). */
+export type CfBrowserPage = {
+  sessionId: string;
+  targetId: string;
+  url: string;
+  title: string;
+  loaded: boolean;
+};
+
+/** Which of a session's targets a call is for: the session's first page when omitted, and
+ *  `"browser"` for the browser's own endpoint (`Target.*`, `Browser.*`). `timeoutMs` bounds the
+ *  command (30 seconds when omitted). */
+export type CfBrowserCdpOptions = { targetId?: string; timeoutMs?: number };
+
+/** `itx.browser`: Cloudflare Browser Run.
+ *
+ *  ONE-SHOT: `quickAction` renders a page and answers the action's RESULT (a string, parsed JSON, or
+ *  bytes for a screenshot or a PDF), not the binding's `{ success, result }` envelope; a failed
+ *  action throws.
+ *
+ *  A SESSION is a browser that stays open between calls, with its pages, cookies and sign-ins:
+ *  `openPage({ url })` starts one and answers once the page loaded, `cdp(sessionId, method, params)`
+ *  runs one Chrome DevTools Protocol command on it (read with `Runtime.evaluate`, click by
+ *  evaluating a script, type with `Input.insertText`, picture with `Page.captureScreenshot`),
+ *  `navigate` loads another URL in the same page, and `closeSession` ends it. A session left open
+ *  is billed until its `keepAlive` runs out. Every session call names a session by the id
+ *  `openPage` or `acquire` answered, which is the capability: nothing here lists sessions.
+ *
+ *  `fetch` is the binding's raw endpoint, for a library that speaks CDP itself. */
 export type CfBrowserApi = {
   fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
   quickAction(action: CfBrowserQuickAction, options: CfBrowserQuickActionOptions): Promise<unknown>;
+  /** A new session with `url` open in its page. `keepAlive` is five minutes when omitted. */
+  openPage(input: { url: string } & CfBrowserSessionOptions): Promise<CfBrowserPage>;
+  /** Another URL in a session's page (the first page, or `targetId`'s). */
+  navigate(sessionId: string, url: string, options?: CfBrowserCdpOptions): Promise<CfBrowserPage>;
+  /** One CDP command on a session's page, answered with the command's result. A CDP error throws. */
+  cdp(
+    sessionId: string,
+    method: string,
+    params?: Record<string, unknown>,
+    options?: CfBrowserCdpOptions,
+  ): Promise<unknown>;
+  /** The binding's own `acquire`: a session with a blank page, and `targets` when asked for. */
+  acquire(
+    options?: CfBrowserSessionOptions & { targets?: boolean; liveViewUrlExpiresInMs?: number },
+  ): Promise<{ sessionId: string; targets?: CfBrowserTarget[] }>;
+  /** The session's times and state, or null when there is no such session. */
+  getSession(sessionId: string): Promise<Record<string, unknown> | null>;
+  closeSession(sessionId: string): Promise<{ status: "closing" | "closed" }>;
+  /** A link a person opens to watch (or, without `guardrails`, drive) the session. The link is a
+   *  credential. */
+  getLiveView(
+    sessionId: string,
+    options?: {
+      mode?: "devtools" | "tab" | "full";
+      targetId?: string;
+      expiresInMs?: number;
+      guardrails?: { mode: "readonly" };
+    },
+  ): Promise<{ webSocketDebuggerUrl: string; devtoolsFrontendUrl: string; id: string }>;
+  /** How many sessions the account may run and is running, and when the next may start. */
+  limits(): Promise<{
+    activeSessions: number;
+    maxConcurrentSessions: number;
+    allowedBrowserAcquisitions: number;
+    timeUntilNextAllowedBrowserAcquisition: number;
+    usedBrowserTimeSeconds?: number;
+  }>;
+  /** A session's tabs: list them, open one, bring one to the front, close one. */
+  devtools: {
+    getVersion(sessionId: string): Promise<Record<string, unknown>>;
+    listTargets(sessionId: string): Promise<CfBrowserTarget[]>;
+    getTarget(sessionId: string, targetId: string): Promise<CfBrowserTarget>;
+    newTarget(sessionId: string, url?: string): Promise<CfBrowserTarget>;
+    activateTarget(sessionId: string, targetId: string): Promise<{ message: string }>;
+    closeTarget(sessionId: string, targetId: string): Promise<{ message: string }>;
+  };
 };
 
 /** A token for an Artifacts repo's git remote. */

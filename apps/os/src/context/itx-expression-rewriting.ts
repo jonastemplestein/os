@@ -64,7 +64,8 @@ export const BUILT_IN_ROOT_DESCRIPTIONS = {
   fetchRoutes:
     "which itx expression a request on this project's hosts goes to: `fetchRoutes.set(name, { requestMatcher: { routingSlug?, url?, headers? }, target, authRequirement?, priority? } | null)` · `list()` · `match({ url, headers })`; the platform serves a match from `route.target`, before the config worker's fetch",
   ai: "Workers AI, verbatim: `ai.run(model, inputs)`",
-  browser: 'browser rendering: `browser.quickAction("markdown", { url })`',
+  browser:
+    'Cloudflare Browser Run. One-shot: `browser.quickAction("markdown", { url })` (also "content", "screenshot", "pdf", "links", "json", "snapshot", "scrape"). A session, to click and type: `browser.openPage({ url })` → { sessionId, targetId, url, title, loaded }; `browser.cdp(sessionId, method, params)` runs one Chrome DevTools Protocol command on its page (`Runtime.evaluate` with { expression, returnByValue: true, awaitPromise: true } to read or click, `Input.insertText`, `Page.captureScreenshot`); `browser.navigate(sessionId, url)`; `browser.devtools.listTargets(sessionId)` · `newTarget(sessionId, url)` for tabs; `browser.getLiveView(sessionId)` → a link to watch it; `browser.closeSession(sessionId)` when done (an open session is billed until its keepAlive, five minutes by default, runs out)',
   r2: "the object store, verbatim (`files` is the friendlier surface)",
   cfArtifacts: "the Artifacts binding, project-scoped (`repos` is the friendlier surface)",
   append: "write events to this log: `itx.append({ type, payload })`",

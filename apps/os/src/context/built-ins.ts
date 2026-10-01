@@ -299,8 +299,9 @@ export interface BuiltInScope extends LibraryRoots {
    *  (`itx.fable ⇒ itx.ai.run('@cf/…', @)`). A test shadows it with `provide("itx.ai", fake)`; the
    *  platform's stays `itx.builtins.ai`. */
   ai: IterateContextApi["ai"];
-  /** Cloudflare Browser Run: `.quickAction(action, options)` returns the
-   *  action's RESULT; `.fetch(input, init)` is the raw CDP endpoint. */
+  /** Cloudflare Browser Run (browser.ts): `.quickAction(action, options)` returns the action's
+   *  RESULT; `.openPage`, `.cdp`, `.navigate` and `.closeSession` drive a session that stays open
+   *  between calls; `.fetch(input, init)` is the raw CDP endpoint. */
   browser: IterateContextApi["browser"];
   /** THE ARTIFACTS PROXY (cf-artifacts.ts `projectScopedArtifacts`): Cloudflare Artifacts, project-scoped and
    *  addressed BY THE REPO'S PATH — the binding's own verbs only: `create`, `get` (a handle with
