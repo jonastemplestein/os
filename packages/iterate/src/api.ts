@@ -11,7 +11,19 @@
 // The roots installed apps add are NOT here: each app registers its own on `InstalledAppRoots` from
 // its package, and `IterateContextApiWith` spells a context that has them.
 
-import type { Ai, R2HTTPMetadata, R2Range } from "@cloudflare/workers-types";
+import type {
+  Ai,
+  AiGatewayLog,
+  AiGatewayPatchLog,
+  AIGatewayUniversalRequest,
+  AiWebSearchRequest,
+  ConversionRequestOptions,
+  ConversionResponse,
+  R2HTTPMetadata,
+  R2Range,
+  SupportedFileFormat,
+  UniversalGatewayOptions,
+} from "@cloudflare/workers-types";
 import type { InvokeHandle, ItxExpression, ItxExpressionInput } from "./expression.ts";
 import type { ConsentScope } from "./oauth-scopes.ts";
 import type { Principal } from "./principal.ts";
@@ -402,6 +414,75 @@ export type CfBrowserPage = {
  *  `"browser"` for the browser's own endpoint (`Target.*`, `Browser.*`). `timeoutMs` bounds the
  *  command (30 seconds when omitted). */
 export type CfBrowserCdpOptions = { targetId?: string; timeoutMs?: number };
+
+/** `itx.ai`: the Workers AI binding's methods under their own names and shapes, as far as a call
+ *  across RPC can carry them. No RPC carries a Blob, so a file for `toMarkdown` is its bytes; and a
+ *  method whose binding answers a Response (`websearch`, a gateway's `run`) answers that Response's
+ *  body. The binding's `aiSearch()` and `autorag(id)` are not here: Cloudflare deprecated both for
+ *  the `ai_search` bindings, and both reach every instance on the deployment's account. Nor is
+ *  `aiGatewayLogId`, which the binding sets after each `run` and so holds whichever call ended
+ *  last. */
+export type ItxAiApi = Pick<Ai, "run" | "models"> & {
+  /** Documents, spreadsheets, web pages and pictures as Markdown: Cloudflare's `toMarkdown`. One
+   *  file answers one result, a list a list; a file Cloudflare cannot convert answers
+   *  `format: "error"` in its place. With no files, the service, for `supported()`. */
+  toMarkdown(): ItxToMarkdownService;
+  toMarkdown(
+    files: ItxMarkdownDocument[],
+    options?: ConversionRequestOptions,
+  ): Promise<ConversionResponse[]>;
+  toMarkdown(
+    files: ItxMarkdownDocument,
+    options?: ConversionRequestOptions,
+  ): Promise<ConversionResponse>;
+  /** AI Gateway `gatewayId` on the deployment's account. */
+  gateway(gatewayId: string): ItxAiGateway;
+  /** Cloudflare's Web Search API through AI Gateway `gatewayId`, billed to that gateway's
+   *  credits (or a provider key stored on it): the answer's body. */
+  websearch(request: AiWebSearchRequest): Promise<ItxWebSearchAnswer>;
+};
+
+/** A file for `itx.ai.toMarkdown`: Cloudflare's `{ name, blob }` with what the Blob is made of in
+ *  place of the Blob, bytes or text (`new Blob([blob], { type })`), or `{ name, data }` with the
+ *  bytes in base64. `name`'s extension tells Cloudflare the format; `type` is
+ *  `application/octet-stream` when omitted. */
+export type ItxMarkdownDocument =
+  | { name: string; blob: Uint8Array | ArrayBuffer | string; type?: string }
+  | { name: string; data: string; type?: string };
+
+/** `itx.ai.toMarkdown()`: the binding's `ToMarkdownService`. */
+export type ItxToMarkdownService = {
+  transform(
+    files: ItxMarkdownDocument[],
+    options?: ConversionRequestOptions,
+  ): Promise<ConversionResponse[]>;
+  transform(
+    files: ItxMarkdownDocument,
+    options?: ConversionRequestOptions,
+  ): Promise<ConversionResponse>;
+  supported(): Promise<SupportedFileFormat[]>;
+};
+
+/** `itx.ai.gateway(id)`: the binding's `AiGateway`. `run` is the gateway's universal endpoint and
+ *  answers the provider's body: parsed JSON, text, or bytes. `getLog` and `patchLog` take a log's
+ *  id as the gateway's log list shows it; a gateway may log other projects' calls too, so nothing
+ *  here lists them. */
+export type ItxAiGateway = {
+  getLog(logId: string): Promise<AiGatewayLog>;
+  patchLog(logId: string, data: AiGatewayPatchLog): Promise<void>;
+  getUrl(provider?: string): Promise<string>;
+  run(
+    data: AIGatewayUniversalRequest | AIGatewayUniversalRequest[],
+    options?: { gateway?: UniversalGatewayOptions; extraHeaders?: object },
+  ): Promise<unknown>;
+};
+
+/** What `itx.ai.websearch` answers: the Web Search API's JSON. A result carries more fields when its
+ *  provider gives them (Exa: `imageUrl`, `lastModifiedDate`). */
+export type ItxWebSearchAnswer = {
+  items: ({ url: string; title: string; description?: string } & Record<string, unknown>)[];
+  metadata: { query: string; requestId: string; latencyMs: number } & Record<string, unknown>;
+};
 
 /** `itx.browser`: Cloudflare Browser Run.
  *
@@ -1081,9 +1162,8 @@ export interface IterateContextApi {
    *  request, `deleted` cross-posted to `/`, the row disabled). A relative `path` means the caller's. */
   repos: EntityCollectionApi<RepoHandle>;
   workspaces: EntityCollectionApi<WorkspaceHandle>;
-  /** Workers AI's `run(model, inputs, options?)` and `models()`, under this context's capability
-   *  rules. */
-  ai: Pick<Ai, "run" | "models">;
+  /** Workers AI's binding (`ItxAiApi`), under this context's capability rules. */
+  ai: ItxAiApi;
   /** Cloudflare Browser Run. */
   browser: CfBrowserApi;
   /** Cloudflare Artifacts, project-scoped (`repos` is the friendlier surface). */

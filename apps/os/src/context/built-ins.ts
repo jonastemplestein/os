@@ -294,8 +294,9 @@ export interface BuiltInScope extends LibraryRoots {
    *  table, enforces `authRequirement` and serves a match from `route.target`, before the config
    *  worker's fetch (worker.ts `serveProjectHost`). Only on a project's root. */
   fetchRoutes: IterateContextApi["fetchRoutes"];
-  /** THE FIRST BINDINGS ROOT: Workers AI's `run(model, inputs, options?)` and `models()`, through
-   *  the stateless `ItxAi` entrypoint (itx-ai.ts), so a rewrite rule can pin a model with `@`
+  /** THE FIRST BINDINGS ROOT: the Workers AI binding's methods (`run`, `models`, `toMarkdown`,
+   *  `gateway`, `websearch`), through the stateless `ItxAi` entrypoint (itx-ai.ts), so a rewrite
+   *  rule can pin a model with `@`
    *  (`itx.fable ⇒ itx.ai.run('@cf/…', @)`). A test shadows it with `provide("itx.ai", fake)`; the
    *  platform's stays `itx.builtins.ai`. */
   ai: IterateContextApi["ai"];
