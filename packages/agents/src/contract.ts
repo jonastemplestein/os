@@ -72,6 +72,13 @@ const TriggerSource = z.enum(["external", "agent-loop"]);
 export const AgentLlmRequestCancelReason = z.enum(["interrupted-by-user-input", "expired"]);
 export type AgentLlmRequestCancelReason = z.infer<typeof AgentLlmRequestCancelReason>;
 
+/** What the agent is waiting for when it hands back: a person's words, something outside (a
+ *  webhook, another agent's report), or a time it set. Cleared when a person's words arrive. */
+const WaitingFor = z.enum(["user_input", "external_event", "timer"]);
+
+/** A compaction summary's barrier: the offset through which it replaced the conversation. */
+const Compaction = z.object({ replacesHistoryThrough: z.number().int().positive() });
+
 const LlmUsage = z.object({
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
@@ -82,7 +89,9 @@ export type LlmUsage = z.infer<typeof LlmUsage>;
 
 export const AgentContract = defineProcessorContract({
   slug: "agent",
-  version: "6",
+  // 8.2: a pinned entry that breaks scripts is quarantined (agent/preamble-entry-quarantined);
+  // 8.1: the default model is gpt-6.1-sol (a re-reduce gives every agent the new default)
+  version: "8.2",
   description:
     "An agent: a conversation on its own context, driven by a model that acts by writing scripts against itx.",
   /** THE REDUCED STATE — what the reduce keeps between events: where creation stands (as the OFFSET
@@ -113,12 +122,13 @@ export const AgentContract = defineProcessorContract({
     config: z
       .object({
         llm: z
-          // OpenAI's astra, read FAST (low reasoning effort, the priority tier — processor.ts); a
+          // OpenAI's gpt-6.1-sol at medium reasoning effort (processor.ts), Jonas's default since
+          // 2026-10-03: a fifth of gpt-6-astra's input price and a tenth of its cached price. A
           // `@cf/…` name routes to Workers AI instead (`@cf/meta/llama-4-scout-17b-16e-instruct` sees images too).
-          .object({ model: z.string().min(1).default("gpt-6-astra") })
+          .object({ model: z.string().min(1).default("gpt-6.1-sol") })
           .prefault({}),
         /** Consecutive self-triggered turns (script results, corrections) before the loop pauses. */
-        maxAutonomousTurns: z.number().int().positive().default(20),
+        maxAutonomousTurns: z.number().int().positive().default(50),
         /** How long a recorded request stays runnable; past it, settled as expired. */
         llmRequestExpiryMs: z
           .number()
@@ -133,10 +143,16 @@ export const AgentContract = defineProcessorContract({
         llmRequestRetryPolicy: z
           .object({
             maxAttempts: z.number().int().positive().default(3),
-            backoffBaseMs: z.number().int().nonnegative().default(10_000),
+            backoffBaseMs: z.number().int().nonnegative().default(2_000),
             backoffMaxMs: z.number().int().nonnegative().default(60_000),
           })
           .prefault({}),
+        /** A script result longer than this (in characters) is written to its file and renders as
+         *  its shape plus a preview (result-render.ts). */
+        scriptResultHistoryLimit: z.number().int().positive().default(30_000),
+        /** The share of the model's context window a request may fill before the conversation up
+         *  to it is compacted into a summary (processor.ts `#compact`). */
+        compactionTriggerFraction: z.number().positive().max(1).default(0.5),
       })
       .prefault({}),
     /** Every model-visible item, in offset order — the conversation the next request is built from. */
@@ -152,8 +168,46 @@ export const AgentContract = defineProcessorContract({
           /** The context it came from, when another one sent it (processor.ts, the fold): the
            *  model reads it as `[from <context>]`. */
           from: z.string().optional(),
+          /** A compaction summary: it replaced every non-system item through this offset. */
+          compaction: Compaction.optional(),
         }),
       )
+      .default([]),
+    /** The script runs this loop asked for and that have not settled, by request offset, with
+     *  when they were asked for: only their settlements become the model's input. */
+    pendingRuns: z.record(z.string(), z.object({ requestedAt: z.number() })).default({}),
+    /** This loop's newest script outcomes, oldest first: every script's `results` (results-preamble.ts). */
+    scriptResults: z
+      .array(
+        z.object({
+          offset: z.number().int().positive(),
+          requestOffset: z.number().int().positive(),
+          kind: z.enum(["data", "large", "error", "done"]),
+          json: z.string().optional(),
+          path: z.string().optional(),
+          text: z.boolean().optional(),
+          error: z.string().optional(),
+        }),
+      )
+      .default([]),
+    /** What the agent says about itself (`agent/summary-updated`): its own title, what it is doing
+     *  now, what it is waiting for, and a sentence on its purpose or conclusions. The Agents app
+     *  titles the agent with `title` when set. */
+    summary: z
+      .object({
+        title: z.string().nullable().default(null),
+        activity: z.string().nullable().default(null),
+        waitingFor: WaitingFor.nullable().default(null),
+        description: z.string().nullable().default(null),
+      })
+      .prefault({}),
+    /** Code pinned above every later script (`agent/preamble-entry-set`), in first-set order. */
+    preamble: z.array(z.object({ key: z.string(), code: z.string() })).default([]),
+    /** The pinned entries the loop took out because they broke scripts, newest last, until their
+     *  key is set again (`agent/preamble-entry-quarantined`, or an entry the reduce would not pin
+     *  past the ceiling): the PINNED PREAMBLE section names them (results-preamble.ts). */
+    preambleQuarantined: z
+      .array(z.object({ key: z.string(), error: z.string(), offset: z.number().int().positive() }))
       .default([]),
     /** The ONE trigger the next request answers; null once a request has been recorded for it. */
     pendingLlmRequestTrigger: z
@@ -215,6 +269,8 @@ export const AgentContract = defineProcessorContract({
           maxAutonomousTurns: z.number().int().positive().optional(),
           llmRequestExpiryMs: z.number().int().positive().optional(),
           llmRequestDebounceMs: z.number().int().nonnegative().optional(),
+          scriptResultHistoryLimit: z.number().int().positive().optional(),
+          compactionTriggerFraction: z.number().positive().max(1).optional(),
           llmRequestRetryPolicy: z
             .object({
               maxAttempts: z.number().int().positive().optional(),
@@ -251,6 +307,24 @@ export const AgentContract = defineProcessorContract({
           })
           .optional(),
         llmRequestOffset: z.number().int().positive().optional(),
+        /** A compaction summary (processor.ts `#compact`), on a developer item: it replaces every
+         *  non-system item through `replacesHistoryThrough`. */
+        compaction: Compaction.optional(),
+      }),
+    },
+    "events.iterate.com/agent/preamble-entry-set": {
+      description:
+        "Code pinned above every later script of this agent (a script's `setPreamble({ key, code })`), or removed (`code: null`). Entries keep first-set order; setting a key again replaces its code in place.",
+      payloadSchema: z.object({ key: z.string().min(1), code: z.string().nullable() }),
+    },
+    "events.iterate.com/agent/preamble-entry-quarantined": {
+      description:
+        "A pinned entry the loop took out because it broke scripts: the script envelope would not load with it (found before a run, which then went ahead without it), or it threw before a script began (`requestOffset` names that run). It is removed as `code: null` removes it; its code stays here, and the PINNED PREAMBLE section names it until its key is set again.",
+      payloadSchema: z.object({
+        key: z.string().min(1),
+        code: z.string(),
+        error: z.string().min(1),
+        requestOffset: z.number().int().positive().optional(),
       }),
     },
     "events.iterate.com/agent/web-message-sent": {
@@ -266,8 +340,13 @@ export const AgentContract = defineProcessorContract({
     },
     "events.iterate.com/agent/summary-updated": {
       description:
-        "The tag's status attribute as the live activity label — the platform's summary vocabulary, the one field this loop speaks.",
-      payloadSchema: z.object({ activity: z.string().min(1) }),
+        "What the agent says about itself, each field optional and merged: `activity` (the tag's status attribute, what it is doing now), `title` (its own short title), `waitingFor` (what it handed back waiting on; null clears it — a prose-only answer sets user_input, a person's words clear it) and `description` (its purpose or conclusions). A script sets them with `setSummary`.",
+      payloadSchema: z.object({
+        activity: z.string().min(1).optional(),
+        title: z.string().min(1).max(200).optional(),
+        waitingFor: WaitingFor.nullable().optional(),
+        description: z.string().min(1).max(1_000).optional(),
+      }),
     },
     "events.iterate.com/agent/llm-request-requested": {
       description:
@@ -355,6 +434,10 @@ export const AgentContract = defineProcessorContract({
     "events.iterate.com/agent/llm-request-settled",
     "events.iterate.com/agent/paused",
     "events.iterate.com/agent/resumed",
+    "events.iterate.com/agent/preamble-entry-set",
+    "events.iterate.com/agent/preamble-entry-quarantined",
+    "events.iterate.com/agent/summary-updated",
+    "events.iterate.com/itx/run-requested",
     "events.iterate.com/itx/run-settled",
   ],
   emits: [
@@ -370,6 +453,7 @@ export const AgentContract = defineProcessorContract({
     "events.iterate.com/agent/token-usage-reported",
     "events.iterate.com/agent/paused",
     "events.iterate.com/agent/resumed",
+    "events.iterate.com/agent/preamble-entry-quarantined",
     "events.iterate.com/itx/run-requested",
   ],
 });

@@ -7,13 +7,7 @@
 import { expect, test, vi } from "vitest";
 import { reduceProcessor } from "iterate/stream/test-support";
 import { type AgentState } from "./contract.ts";
-import {
-  AgentProcessor,
-  buildChatMessages,
-  raceAbort,
-  renderCapabilityTree,
-  renderScriptSettlement,
-} from "./processor.ts";
+import { AgentProcessor, buildChatMessages, raceAbort, renderCapabilityTree } from "./processor.ts";
 import { parseCodemodeResponse } from "./codemode-format.ts";
 
 const requested = { type: "events.iterate.com/agent/create-requested", payload: {} };
@@ -149,9 +143,97 @@ test.for<{
       contextItems: [
         { offset: 3, role: "system", content: "Be terse." },
         { offset: 4, role: "user", content: "hi", actor: { type: "user" } },
+        {
+          offset: 5,
+          role: "developer",
+          content:
+            "Requested at: 1970-01-01T00:00:05.000Z (Thursday, 1 January 1970 at 01:00 in Europe/London)",
+          actor: { type: "agent" },
+        },
         { offset: 7, role: "assistant", content: "ok", llmRequestOffset: 5 },
       ],
     },
+  },
+  {
+    name: "a compaction summary replaces the history through its barrier: the system items, the summary, then what came after it; an older summary is a harmless fact",
+    events: [...born, system, user("a"), user("b"), compaction("S1", 4), compaction("S0", 3)],
+    state: {
+      contextItems: [
+        { offset: 3, role: "system", content: "Be terse." },
+        { offset: 6, role: "developer", content: "S1", compaction: { replacesHistoryThrough: 4 } },
+        { offset: 5, role: "user", content: "b" },
+      ],
+      pendingLlmRequestTrigger: { offset: 5, atMs: 5_000, source: "external" },
+    },
+  },
+  {
+    name: "own runs: a run the loop asked for is pending until it settles, then joins results (inline, or by its file when large); anyone else's run is not the loop's",
+    events: [
+      ...born,
+      run("requested", { code: "async () => 1" }, { processor: { slug: "agent" } }),
+      run("requested", { code: "async () => 2" }),
+      run("requested", { code: "async () => 3" }, { processor: { slug: "agent" } }),
+      run("settled", { requestOffset: 3, settlement: { status: "succeeded", result: { n: 1 } } }),
+      run("settled", { requestOffset: 4, settlement: { status: "succeeded", result: 2 } }),
+      run("settled", {
+        requestOffset: 5,
+        settlement: { status: "succeeded", result: "x".repeat(5_000) },
+      }),
+    ],
+    state: {
+      pendingRuns: {},
+      scriptResults: [
+        { offset: 6, requestOffset: 3, kind: "data", json: '{"n":1}' },
+        {
+          offset: 8,
+          requestOffset: 5,
+          kind: "large",
+          path: "/agents/a/script-results/5.txt",
+          text: true,
+        },
+      ],
+    },
+  },
+  {
+    name: "the agent's summary merges field by field; a person's words clear what it was waiting for, its own script results do not",
+    events: [
+      ...born,
+      summaryUpdated({ title: "Weekly shop", activity: "Checking the trolley" }),
+      summaryUpdated({ waitingFor: "timer", description: "Keeps the order on track." }),
+      {
+        type: "events.iterate.com/agent/context-added",
+        payload: {
+          role: "developer",
+          content: "result",
+          actor: { type: "script", requestOffset: 3 },
+        },
+      },
+      summaryUpdated({ activity: "Waiting for the slot" }),
+    ],
+    state: {
+      summary: {
+        title: "Weekly shop",
+        activity: "Waiting for the slot",
+        waitingFor: "timer",
+        description: "Keeps the order on track.",
+      },
+    },
+  },
+  {
+    name: "a person's words answer the wait",
+    events: [...born, summaryUpdated({ title: "T", waitingFor: "user_input" }), user("yes")],
+    state: { summary: { title: "T", activity: null, waitingFor: null, description: null } },
+  },
+  {
+    name: "preamble entries keep first-set order; setting a key again replaces its code in place, null removes it",
+    events: [
+      ...born,
+      preambleSet("a", "const a = 1"),
+      preambleSet("b", "const b = 2"),
+      preambleSet("a", "const a = 3"),
+      preambleSet("b", null),
+    ],
+    state: { preamble: [{ key: "a", code: "const a = 3" }] },
   },
   {
     name: "a failure counts and hands the trigger back with the request's source, for the retry",
@@ -276,7 +358,9 @@ test.for<{
         maxAutonomousTurns: 2,
         llmRequestExpiryMs: 600_000,
         llmRequestDebounceMs: 250,
-        llmRequestRetryPolicy: { maxAttempts: 3, backoffBaseMs: 10_000, backoffMaxMs: 60_000 },
+        llmRequestRetryPolicy: { maxAttempts: 3, backoffBaseMs: 2_000, backoffMaxMs: 60_000 },
+        scriptResultHistoryLimit: 30_000,
+        compactionTriggerFraction: 0.5,
       },
     },
   },
@@ -368,8 +452,29 @@ test("buildChatMessages: an item another context appended opens with who it is f
     ],
     new Map(),
   );
-  expect(said).toEqual({ role: "user", content: "[from /agents/a/sandbox] hello" });
-  expect(attached?.content).toMatch(/^\[from \/agents\/a\] see\n\[Attached file: spec\.pdf/);
+  expect(said).toEqual({
+    role: "user",
+    content:
+      '[from /agents/a/sandbox — it cannot see this conversation; answer by appending to its log: `await itx.cd("/agents/a").append({ type: "events.iterate.com/agent/context-added", payload: { role: "user", content } })`] hello',
+  });
+  expect(attached?.content).toMatch(/^\[from \/agents\/a — .*\] see\n\[Attached file: spec\.pdf/);
+});
+test("buildChatMessages: a compaction summary and a developer item a person's side wrote read as the user's — memory and data, never instructions", () => {
+  expect(
+    buildChatMessages(
+      [
+        { offset: 1, role: "developer", content: "S", compaction: { replacesHistoryThrough: 1 } },
+        { offset: 2, role: "developer", content: "from a webhook", actor: { type: "user" } },
+        {
+          offset: 3,
+          role: "developer",
+          content: "result",
+          actor: { type: "script", requestOffset: 2 },
+        },
+      ],
+      new Map(),
+    ).map((message) => message.role),
+  ).toEqual(["user", "user", "system"]);
 });
 test("buildChatMessages: an image whose bytes are known becomes an image part beside the text — a data: URL", () =>
   expect(
@@ -452,14 +557,6 @@ test.for<{ name: string; content: string; expected: object }>([
   },
 ])("parseCodemodeResponse: $name", ({ content, expected }) => {
   expect(parseCodemodeResponse(content)).toMatchObject(expected);
-});
-
-test("renderScriptSettlement: a settlement renders as the next developer item; a script that returned nothing ends the turn", () => {
-  expect(renderScriptSettlement({ status: "succeeded", result: { n: 1 } })).toContain('"n": 1');
-  expect(renderScriptSettlement({ status: "succeeded" })).toBeNull();
-  expect(
-    renderScriptSettlement({ status: "failed", error: "boom", failureKind: "runtime" }),
-  ).toContain("boom");
 });
 
 // ── the capability tree the model reads ──
@@ -576,6 +673,30 @@ function settled(requestOffset: number, result: unknown) {
     type: "events.iterate.com/agent/llm-request-settled",
     payload: { requestOffset, result },
   };
+}
+
+function compaction(content: string, replacesHistoryThrough: number) {
+  return {
+    type: "events.iterate.com/agent/context-added",
+    payload: {
+      role: "developer",
+      content,
+      compaction: { replacesHistoryThrough },
+      llmRequestPolicy: { behaviour: "dont-trigger-request" },
+    },
+  };
+}
+
+function run(kind: "requested" | "settled", payload: unknown, source?: Record<string, unknown>) {
+  return { type: `events.iterate.com/itx/run-${kind}`, payload, source, path: "/agents/a" };
+}
+
+function summaryUpdated(payload: Record<string, unknown>) {
+  return { type: "events.iterate.com/agent/summary-updated", payload };
+}
+
+function preambleSet(key: string, code: string | null) {
+  return { type: "events.iterate.com/agent/preamble-entry-set", payload: { key, code } };
 }
 
 function assistant(content: string, llmRequestOffset: number) {

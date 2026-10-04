@@ -20,6 +20,7 @@ import {
   type ProcessEventArgs,
   type ReduceArgs,
 } from "iterate/stream/processor";
+import { RunEventCatalog } from "iterate/stream/run";
 import { z } from "zod";
 
 /** The device's call identity: the press mints it, the frames carry it. */
@@ -29,7 +30,8 @@ const Activation = z.string().min(1).max(64);
 const LIVE = {
   url: "https://api.openai.com/v1/live/sessions",
   model: "gpt-live-1",
-  voice: "marin",
+  // GPT-Live's British masculine voice
+  voice: "vesper",
   rate: 16_000,
 } as const;
 
@@ -71,6 +73,11 @@ const OPENING_DEADLINE_MS = 15_000;
 const HANG_UP_TOKEN = "HANG_UP";
 export const HANG_UP_GOODBYE_GRACE_MS = 8_000;
 
+/** The floor between unprompted spoken progress notes, counted from the hand-over itself: work
+ * that answers sooner is simply answered, and a long job is narrated, not ticked through (the
+ * legacy relay's `SPOKEN_STATUS_MIN_GAP_MS`, 15 s at abbf8edb0^; Jonas wants 10). */
+const SPOKEN_PROGRESS_MIN_GAP_MS = 10_000;
+
 /** Microphone audio held while the provider completes its handshake: 21 s covers the clients'
  * 20 s opening capture. Overflow ends the call with a reason, because keeping a truncated request
  * would tell the model a different one. */
@@ -81,6 +88,14 @@ const MAX_HELD_MIC_BYTES = 21_000 * PCM16_BYTES_PER_MS;
  * transparent about the backend on purpose: a model forbidden to mention it invented explanations
  * for delays. */
 const LIVE_DELEGATION_POLICY = [
+  "Identity: You are the person's chief of staff, speaking with them on a call: courteous, brief",
+  "and gently dry. The backend below is you as well: it is how you look things up and act. To",
+  "the person there is only you.",
+  "Never mention a backend, an agent or 'your chief of staff', and never offer to hand a thing",
+  "over or to check with someone: say 'let me check' or 'one moment', then give the answer as",
+  "your own. When the call opens with words for you to say, say them once and add no greeting",
+  "of your own.",
+  "",
   "Backchannel policy: Use moderate backchannels. Acknowledge naturally without competing",
   "with the main response.",
   "Interruption policy: Stop speaking when the user interrupts. Listen to what they say.",
@@ -105,13 +120,23 @@ const LIVE_DELEGATION_POLICY = [
   "- It is social conversation, a brief clarifying question, or repeating a verified result.",
   "Request client delegation IMMEDIATELY, BEFORE acknowledging an action or saying",
   "you will check. Saying 'I'll check' does not start backend work. Only after delegating",
-  "may you say you've handed it over. Past acknowledgments in conversation history do not",
+  "may you say you are on it ('let me check', 'one moment'). Past acknowledgments in conversation history do not",
   "mean a request in this new call has been delegated. Keep conversing while the Agent works.",
   "Do not guess results or invent progress. Say a thing is",
   "done only when the backend has reported it done for THAT request. Relay backend results",
   "faithfully, read one out in full when the person wants the details, and correct yourself",
   "plainly if one contradicts something you said. If the backend reports a failure, SAY SO",
   "— never invent an explanation for a delay or a result you have not seen.",
+  "Progress policy:",
+  "- The backend's progress reaches you as notes beginning 'Progress:', and they are ground truth",
+  "  about what it is doing right now. When the person asks how it is going, relay the latest",
+  "  one plainly ('it's checking your trolley now'); if none has arrived, say the work just started.",
+  "- When a progress note arrives for you to say, it is a progress ping, not a result: a FEW",
+  "  WORDS ('still checking the trolley', 'a script failed, it's having another go'). Never pad,",
+  "  never re-say the previous note in new words, never speculate past what it says, and never",
+  "  present it as done. If the real answer has arrived, say THAT instead.",
+  "- Other words from the backend while it works are messages it chose to tell the person now:",
+  "  say them.",
 ].join("\n");
 
 /** A fold transcript turn: who spoke, and what the provider heard them say. */
@@ -217,7 +242,7 @@ export type VoiceLiveView = {
 
 const VoiceAgentContract = defineProcessorContract({
   slug: "voice-agent",
-  version: "2.0.0",
+  version: "2.1.0",
   description:
     "Runs a GPT-Live voice call in the conversation's own Durable Object, relaying audio both ways as it arrives and the live model's delegations to the agent on the same context.",
   stateSchema: VoiceState,
@@ -304,12 +329,14 @@ const VoiceAgentContract = defineProcessorContract({
       }),
     },
   },
-  /* The agent on this context owns its events; its messages are what the live model speaks. */
-  processorDeps: [AgentContract],
+  /* The agent on this context owns its events; its messages are what the live model speaks. The
+   * context runs the agent's scripts: a failed one is progress the voice must not paper over. */
+  processorDeps: [AgentContract, RunEventCatalog],
   consumes: [
     "events.iterate.com/agent/summary-updated",
     "events.iterate.com/agent/web-message-sent",
     "events.iterate.com/agent/paused",
+    "events.iterate.com/itx/run-settled",
     "events.iterate.com/voice-agent/call-started",
     "events.iterate.com/voice-agent/call-ended",
     /* Consumed so the fold sees its own appends and the recap survives an eviction. */
@@ -403,6 +430,12 @@ interface Dial {
   /** Each hand-over, oldest first: the live model's delegation id and the offset of the
    *  `agent/context-added` that carried it. An answer speaks for the newest one its request read. */
   delegations: { delegationId: string; offset: number }[];
+  /** A hand-over the agent has not answered yet: progress is spoken only while one is. */
+  awaitingAnswer: boolean;
+  /** The last status passed on, so a repeat is not news. */
+  lastProgress: string | null;
+  /** When the person was last told something unprompted (a hand-over counts), on the facet clock. */
+  lastSpokenProgressAtFacetMs: number;
   /** The answer in flight. */
   answer: Answer;
   /** How far, on the facet clock, the device's forwarded audio reaches: each forwarded chunk
@@ -439,6 +472,9 @@ const freshDial = (conversationId: string, activation: string): Dial => ({
   transcript: [],
   turnsForAgent: [],
   delegations: [],
+  awaitingAnswer: false,
+  lastProgress: null,
+  lastSpokenProgressAtFacetMs: 0,
   answer: freshAnswer(),
   micAudioCoveredUntilFacetMs: 0,
   timelineMs: 0,
@@ -606,15 +642,25 @@ export class VoiceAgentProcessor extends StreamProcessor<
       /* A dial dies with its incarnation, so a redelivered agent event with no dial is not
        * forwarded. */
       case "events.iterate.com/agent/summary-updated": {
-        /* A script's status: progress the voice may use quietly. */
+        /* A script's status: progress, for the newest hand-over. A title or a wait is not news. */
         const dial = this.#dial;
-        if (!dial) return;
-        this.#sendToLiveModel(dial, {
-          kind: "thinking",
-          delegationId: null,
-          content: event.payload.activity,
-          offset: event.offset,
-        });
+        const { activity } = event.payload;
+        if (!dial || !activity || activity === dial.lastProgress) return;
+        dial.lastProgress = activity;
+        this.#relayProgress(dial, activity, event.offset);
+        return;
+      }
+
+      case "events.iterate.com/itx/run-settled": {
+        /* A failed script is progress the voice must be able to say, never paper over. */
+        const dial = this.#dial;
+        const { settlement } = event.payload;
+        if (!dial || settlement.status !== "failed") return;
+        this.#relayProgress(
+          dial,
+          `a script failed (${settlement.failureKind}): ${settlement.error.slice(0, 200)}`,
+          event.offset,
+        );
         return;
       }
 
@@ -623,7 +669,20 @@ export class VoiceAgentProcessor extends StreamProcessor<
          * script: those words can guess at a result the script has not produced yet. */
         const dial = this.#dial;
         const { message, llmRequestOffset, besideScript } = event.payload;
-        if (!dial || besideScript || !llmRequestOffset) return;
+        if (!dial || besideScript) return;
+        if (!llmRequestOffset) {
+          /* Words a script sent while it ran (`sendMessage`): the agent chose to tell the person
+           * now, so they are spoken — and count as the latest thing the person was told. */
+          dial.lastSpokenProgressAtFacetMs = this.deps.nowAtFacetMs();
+          this.#sendToLiveModel(dial, {
+            kind: "commentary",
+            delegationId: dial.delegations.at(-1)?.delegationId ?? null,
+            content: message,
+            offset: event.offset,
+          });
+          return;
+        }
+        dial.awaitingAnswer = false;
         if (message.includes(HANG_UP_TOKEN)) {
           dial.hangUpReason = "the Agent hung up";
           dial.hangUpArmedAtFacetMs = this.deps.nowAtFacetMs();
@@ -651,6 +710,7 @@ export class VoiceAgentProcessor extends StreamProcessor<
          * than leave the voice waiting on an answer that is not coming. */
         const dial = this.#dial;
         if (!dial) return;
+        dial.awaitingAnswer = false;
         this.#sendToLiveModel(dial, {
           kind: "commentary",
           delegationId: dial.delegations.at(-1)?.delegationId ?? null,
@@ -1219,6 +1279,9 @@ export class VoiceAgentProcessor extends StreamProcessor<
         dial.delegations = [...dial.delegations, { delegationId, offset }].sort(
           (a, b) => a.offset - b.offset,
         );
+        // the hand-over's acknowledgement is the last thing the person was told
+        dial.awaitingAnswer = true;
+        dial.lastSpokenProgressAtFacetMs = this.deps.nowAtFacetMs();
         this.#sendControl(dial, {
           type: "session.thinking.append",
           delegation_id: delegationId,
@@ -1231,6 +1294,25 @@ export class VoiceAgentProcessor extends StreamProcessor<
           `the delegation could not be handed to the agent: ${String(error).slice(0, 200)}`,
         );
       }
+    });
+  }
+
+  /** Progress for the newest hand-over: said aloud when the person is waiting on an answer, nothing
+   * is playing, they are not mid-sentence and nothing was said unprompted for the minimum gap;
+   * otherwise a quiet note the voice relays when asked. The legacy relay's spoken status. */
+  #relayProgress(dial: Dial, progress: string, offset: number): void {
+    const now = this.deps.nowAtFacetMs();
+    const speak =
+      dial.awaitingAnswer &&
+      dial.answer.phase === "settled" &&
+      dial.turns.user === null &&
+      now - dial.lastSpokenProgressAtFacetMs >= SPOKEN_PROGRESS_MIN_GAP_MS;
+    if (speak) dial.lastSpokenProgressAtFacetMs = now;
+    this.#sendToLiveModel(dial, {
+      kind: speak ? "commentary" : "thinking",
+      delegationId: dial.delegations.at(-1)?.delegationId ?? null,
+      content: `Progress: ${progress}`,
+      offset,
     });
   }
 
